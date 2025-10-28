@@ -171,7 +171,7 @@ impl Process {
         })
         .await;
 
-        return Ok(catfile_path);
+        Ok(catfile_path)
     }
 
     async fn get_expected_output_seconds(&self) -> Result<f64, ExecuteError> {

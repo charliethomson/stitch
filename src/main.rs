@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
                 for error in errors {
                     eprintln!("\t{error}")
                 }
-                eprintln!("");
+                eprintln!();
 
                 return Err(e.into());
             }

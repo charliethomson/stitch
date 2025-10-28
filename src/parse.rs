@@ -131,8 +131,8 @@ pub fn parse_spec(
             inner_error: e.into(),
         })?;
 
-        let target_result = try_get_first_capture(&line, &*RE_TARGET)?;
-        let source_result = try_get_first_capture(&line, &*RE_SOURCE)?;
+        let target_result = try_get_first_capture(&line, &RE_TARGET)?;
+        let source_result = try_get_first_capture(&line, &RE_SOURCE)?;
 
         match (target_result, source_result) {
             (Some(target), None) => {

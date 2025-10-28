@@ -5,6 +5,7 @@ use liberror::AnyError;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::{Level, instrument};
 use valuable::Valuable;
 
 lazy_static! {
@@ -12,13 +13,13 @@ lazy_static! {
     static ref RE_SOURCE: Regex = Regex::new(r#"^\t(.+)$"#).expect("Failed to compile RE_SOURCE");
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Valuable)]
 pub struct Plan {
     pub target_path: PlanPath,
     pub sources: Vec<PlanPath>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Valuable)]
 pub struct PlanPath {
     pub path: PathBuf,
     pub leaf: String,
@@ -94,7 +95,10 @@ fn get_spec_reader(
         .map_err(|e| ParseError::Open {
             path: spec_path_raw.clone(),
             inner_error: e.into(),
-        })?;
+        })
+        .inspect(|_| tracing::trace!(path = spec_path_raw, "Sucessfully opened spec file"))
+        .inspect_err(|e| tracing::error!(path = spec_path_raw, error =% e, error_context =? e,"Failed to open spec file"))?;
+
     let reader = std::io::BufReader::new(spec_file);
     Ok(reader.lines())
 }
@@ -108,18 +112,26 @@ fn try_get_first_capture(line: &str, regex: &Regex) -> Result<Option<String>, Pa
     Ok(caps.get(1).map(|c| c.as_str().trim().to_string()))
 }
 
+#[instrument(level = Level::INFO)]
 pub fn parse_spec(
     spec_path: PathBuf,
     target_dir: PathBuf,
     sources_dir: PathBuf,
 ) -> Result<Vec<Plan>, ParseError> {
     let spec_path_raw = spec_path.display().to_string();
+    tracing::debug!(given_path = spec_path_raw, "Canonicalizing spec path");
+
     let spec_path = spec_path
         .canonicalize()
         .map_err(|e| ParseError::SpecNotFound {
             path: spec_path_raw,
             inner_error: e.into(),
         })?;
+
+    tracing::debug!(
+        canonicalized_path = &spec_path.display().to_string(),
+        "Canonicalized spec path"
+    );
 
     let mut plans = Vec::new();
     let mut plan: Option<Plan> = None;
@@ -138,10 +150,23 @@ pub fn parse_spec(
             (Some(target), None) => {
                 if let Some(plan) = plan.take() {
                     if plan.sources.is_empty() {
+                        tracing::warn!(
+                            target = target,
+                            line = line,
+                            plan = plan.as_value(),
+                            "Invalid spec - there are no sources defined for the currently active target"
+                        );
                         return Err(ParseError::MissingSources {
                             target_name: plan.target_path.leaf.clone(),
                         });
                     }
+
+                    tracing::debug!(
+                        line = line,
+                        plan = plan.as_value(),
+                        push_reason = "target_no_source",
+                        "Pushing completed plan"
+                    );
 
                     plans.push(plan);
                 }
@@ -153,6 +178,12 @@ pub fn parse_spec(
             }
             (None, Some(source)) => {
                 let Some(plan) = plan.as_mut() else {
+                    tracing::warn!(
+                        source = source,
+                        line = line,
+                        plan = plan.as_value(),
+                        "Invalid spec - We have encountered a source directive when not processing a target"
+                    );
                     return Err(ParseError::MissingTarget {
                         source_name: source.to_string(),
                     });
@@ -160,9 +191,22 @@ pub fn parse_spec(
 
                 let source_path = PlanPath::new_relative_to(&source, sources_dir.clone());
 
+                tracing::debug!(
+                    line = line,
+                    plan = plan.as_value(),
+                    source = source,
+                    "Adding source"
+                );
+
                 plan.sources.push(source_path);
             }
             (Some(target), Some(source)) => {
+                tracing::warn!(
+                    source = source,
+                    target = target,
+                    line = line,
+                    "Invalid spec - We have somehow matched both source and target, this is likely unreachable"
+                );
                 return Err(ParseError::UnexpectedSourceAndTarget {
                     line: line.to_string(),
                     src: source,
@@ -172,12 +216,19 @@ pub fn parse_spec(
             (None, None) => {
                 // No match, with content
                 if !line.trim().is_empty() {
+                    tracing::warn!(line = line, "Invalid spec - Unrecognized line");
                     return Err(ParseError::InvalidLine {
                         line: line.to_string(),
                     });
                 }
 
                 if let Some(plan) = plan.take() {
+                    tracing::debug!(
+                        line = line,
+                        plan = plan.as_value(),
+                        push_reason = "empty_line",
+                        "Pushing completed plan"
+                    );
                     plans.push(plan)
                 }
             }
@@ -185,10 +236,17 @@ pub fn parse_spec(
     }
 
     if let Some(plan) = plan.take() {
+        tracing::debug!(
+            plan = plan.as_value(),
+            push_reason = "end_of_file",
+            "Pushing completed plan"
+        );
         plans.push(plan)
     }
 
-    // validate plans
+    tracing::info!(plans = plans.as_value(), "Parsed {} targets", plans.len());
+
+    tracing::info!(plans = plans.as_value(), "Validating targets");
 
     let mut validation_errors = vec![];
 
@@ -196,6 +254,11 @@ pub fn parse_spec(
     let mut targets_set = HashSet::new();
     for plan in plans.iter() {
         if targets_set.contains(&plan.target_path.leaf) {
+            tracing::error!(
+                target_name = plan.target_path.leaf,
+                "Found duplicate target"
+            );
+
             validation_errors.push(ValidationError::DuplicateTarget {
                 target_name: plan.target_path.leaf.clone(),
             })
@@ -207,6 +270,11 @@ pub fn parse_spec(
         sources_set.reserve(plan.sources.len());
         for source in plan.sources.iter() {
             if sources_set.contains(&source.leaf) {
+                tracing::error!(
+                    target_name = plan.target_path.leaf,
+                    source_name = source.leaf,
+                    "Found duplicate source"
+                );
                 validation_errors.push(ValidationError::DuplicateSource {
                     source_name: source.leaf.clone(),
                     target_name: plan.target_path.leaf.clone(),
@@ -216,6 +284,13 @@ pub fn parse_spec(
             }
 
             if let Err(e) = source.path.canonicalize() {
+                tracing::error!(
+                    target_name = plan.target_path.leaf,
+                    source_name = source.leaf,
+                    error =% e,
+                    error_context =? e,
+                    "Source file not found"
+                );
                 validation_errors.push(ValidationError::MissingSource {
                     source_name: source.leaf.clone(),
                     source_path: source.path.display().to_string(),
@@ -231,6 +306,12 @@ pub fn parse_spec(
             errors: validation_errors,
         });
     }
+
+    tracing::info!(
+        plans = plans.as_value(),
+        "Successfully validated {} targets",
+        plans.len()
+    );
 
     Ok(plans)
 }

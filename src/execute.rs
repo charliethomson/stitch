@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt, task::JoinSet};
 use tokio_util::{future::FutureExt, sync::CancellationToken};
+use tracing::{Instrument, Level, Span, instrument};
 use uuid::Uuid;
 use valuable::Valuable;
 
@@ -61,7 +62,7 @@ pub enum ExecuteError {
 
 pub type ExecuteResult = Result<(), ExecuteError>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Valuable)]
 pub enum ExecuteProgressPayload {
     Start {
         target_name: String,
@@ -85,6 +86,7 @@ pub struct ExecuteProgress {
     pub payload: ExecuteProgressPayload,
 }
 
+#[derive(Debug)]
 struct Process {
     seq: AtomicUsize,
     id: Uuid,
@@ -129,12 +131,14 @@ impl Process {
 }
 impl Process {
     async fn start(&self) {
+        tracing::info!(id =% self.id, "Process started");
         self.send(ExecuteProgressPayload::Start {
             target_name: self.plan.target_path.leaf.clone(),
         })
         .await;
     }
 
+    #[instrument(level = Level::INFO)]
     async fn prepare_catfile(&self) -> Result<PathBuf, ExecuteError> {
         let catfile_path = self.tmp_root.join(format!(
             "{}.catfile",
@@ -149,7 +153,9 @@ impl Process {
             .map_err(|e| ExecuteError::CreateCatFile {
                 catfile_path: catfile_path.display().to_string(),
                 inner_error: e.into(),
-            })?;
+            })
+            .inspect(|_| tracing::info!(catfile_path =% catfile_path.display(), "Successfully opened catfile"))
+            .inspect_err(|e| tracing::error!(catfile_path =% catfile_path.display(), error =% e, error_context =? e, "Failed to open catfile"))?;
 
         let content = self
             .plan
@@ -164,7 +170,9 @@ impl Process {
             .map_err(|e| ExecuteError::WriteToCatFile {
                 catfile_path: catfile_path.display().to_string(),
                 inner_error: e.into(),
-            })?;
+            })
+            .inspect(|_| tracing::info!(catfile_path =% catfile_path.display(), "Successfully wrote to catfile"))
+            .inspect_err(|e| tracing::error!(catfile_path =% catfile_path.display(), error =% e, error_context =? e, "Failed to write to catfile"))?;
 
         self.send(ExecuteProgressPayload::Prepared {
             cat_path: catfile_path.clone(),
@@ -174,6 +182,7 @@ impl Process {
         Ok(catfile_path)
     }
 
+    #[instrument(level = Level::INFO)]
     async fn get_expected_output_seconds(&self) -> Result<f64, ExecuteError> {
         let mut tasks = JoinSet::new();
 
@@ -211,6 +220,7 @@ impl Process {
         Ok(total_seconds)
     }
 
+    #[instrument(level = Level::INFO)]
     async fn execute(self, catfile_path: PathBuf) -> ExecuteResult {
         let (stderr_tx, mut _todo_do_i_care_stderr_rx) = tokio::sync::mpsc::channel(100);
         let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::channel(100);
@@ -235,19 +245,23 @@ impl Process {
         let total_seconds = self.get_expected_output_seconds().await?;
         let this = Arc::new(self);
         let mut tasks = JoinSet::new();
+        let span = Span::current();
         /* ffmpeg task */
         {
             let this = this.clone();
             let monitor_token = monitor_token.clone();
-            tasks.spawn(async move {
-                this.send(ExecuteProgressPayload::Spawned).await;
-                match process.await {
-                    // TODO: do i care
-                    Ok(_result) => this.send(ExecuteProgressPayload::Finished(_result)).await,
-                    Err(e) => this.send(ExecuteProgressPayload::Failed(e)).await,
+            tasks.spawn(
+                async move {
+                    this.send(ExecuteProgressPayload::Spawned).await;
+                    match process.await {
+                        // TODO: do i care
+                        Ok(_result) => this.send(ExecuteProgressPayload::Finished(_result)).await,
+                        Err(e) => this.send(ExecuteProgressPayload::Failed(e)).await,
+                    }
+                    monitor_token.cancel();
                 }
-                monitor_token.cancel();
-            });
+                .instrument(span.clone()),
+            );
         }
 
         /* stdout task */
@@ -258,13 +272,12 @@ impl Process {
                 loop {
                     match stdout_rx.recv().with_cancellation_token(&monitor_token).await {
                         Some(Some(line)) => {
-                            println!("{}", line);
                             if !RE_OUT_TIME_US.is_match(&line) { continue; }
                             let cap = RE_OUT_TIME_US.captures(&line).and_then(|caps| caps.get(1)).map(|cap| cap.as_str());
                             let Some(cap) = cap else { unreachable!("out_time_us is match but no capture") };
                             match cap.parse::<f64>() {
                                 Err(e) => {
-                                    todo!("Can this fail (out_time_us parse as f64): {e}");
+                                    tracing::error!(error =% e, error_context =? e, line = line, cap = cap, "UNHANDLED: Failed to parse rhs cap of the out_time_us progress log")
                                 }
                                 Ok(out_time_us) => {
                                     this.send(ExecuteProgressPayload::Progress {
@@ -278,7 +291,9 @@ impl Process {
                         None /* cancelled */ => { break },
                     }
                 }
-            });
+            }
+            .instrument(span.clone()),
+            );
         }
 
         tasks.join_all().await;
@@ -287,6 +302,7 @@ impl Process {
     }
 }
 
+#[instrument(level = Level::INFO)]
 pub async fn execute_plan(
     plan: Plan,
     tx: tokio::sync::mpsc::Sender<ExecuteProgress>,

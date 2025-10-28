@@ -38,6 +38,8 @@ where
 
     cb(&mut cmd);
 
+    tracing::debug!(args = ?cmd.as_std().get_args().collect::<Vec<_>>(), "Executing ffprobe command");
+
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -87,9 +89,11 @@ where
             }
 
             Ok(Some(line)) = stdout.next_line() => {
+                tracing::debug!(line = line, "ffprobe wrote to stdout");
                 result.stdout_lines.push(line);
             }
             Ok(Some(line)) = stderr.next_line() => {
+                tracing::debug!(line = line, "ffprobe wrote to stderr");
                 result.stderr_lines.push(line);
             }
         }

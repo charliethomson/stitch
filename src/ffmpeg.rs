@@ -24,10 +24,11 @@ pub enum FfmpegError {
 
 pub type FfmpegResult = Result<FfmpegExit, FfmpegError>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Valuable)]
 pub struct FfmpegExit {
     pub stdout_lines: Vec<String>,
     pub stderr_lines: Vec<String>,
+    #[valuable(skip)]
     pub exit_code: Option<ExitStatus>,
 }
 
@@ -97,12 +98,14 @@ where
 
             Ok(Some(line)) = stdout.next_line() => {
                 result.stdout_lines.push(line.clone());
+                tracing::debug!(line = line, "ffmpeg wrote to stdout");
                 if let Err(e) = stdout_tx.send(line).await {
                     todo!("Failed to write stdout_tx: {e}");
                 };
             }
             Ok(Some(line)) = stderr.next_line() => {
                 result.stderr_lines.push(line.clone());
+                tracing::debug!(line = line, "ffmpeg wrote to stderr");
                 if let Err(e) = stderr_tx.send(line).await {
                     todo!("Failed to write stderr_tx: {e}");
                 };

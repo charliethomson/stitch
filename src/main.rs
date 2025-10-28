@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::{Write, stdout},
     path::PathBuf,
-    time::SystemTime,
+    time::Duration,
 };
 
 use clap::Parser;
@@ -14,6 +14,7 @@ use crossterm::{
 use tokio::task::JoinSet;
 use tokio_util::{future::FutureExt, sync::CancellationToken};
 use uuid::Uuid;
+use valuable::Valuable;
 
 use crate::{
     execute::{ExecuteProgress, ExecuteProgressPayload, execute_plan},
@@ -23,7 +24,9 @@ use crate::{
 pub mod execute;
 pub mod ffmpeg;
 pub mod ffprobe;
+pub mod logging;
 pub mod parse;
+pub mod path;
 
 #[derive(Parser)]
 pub struct Args {
@@ -33,11 +36,14 @@ pub struct Args {
     pub target_dir: Option<PathBuf>,
     #[arg(short = 'i', long)]
     pub sources_dir: Option<PathBuf>,
+    #[arg(short, long, default_value_t = false)]
+    pub verbose: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    logging::register_tracing_subscriber(!args.verbose);
     let cancellation_token = CancellationToken::new();
 
     let cwd = std::env::current_dir().expect(
@@ -52,11 +58,13 @@ async fn main() -> anyhow::Result<()> {
 
         Err(e) => match &e {
             ParseError::Validation { errors } => {
-                eprintln!("Validation failed:");
-                for error in errors {
-                    eprintln!("\t{error}")
+                if !args.verbose {
+                    eprintln!("Validation failed:");
+                    for error in errors {
+                        eprintln!("\t{error}")
+                    }
+                    eprintln!();
                 }
-                eprintln!();
 
                 return Err(e.into());
             }
@@ -67,19 +75,9 @@ async fn main() -> anyhow::Result<()> {
     let mut executions = JoinSet::new();
     let (tx, rx) = tokio::sync::mpsc::channel(100);
 
-    let epoch = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("Why are you in the past?")
-        .as_secs();
-    let tmp_root = std::env::temp_dir().join(format!("dev_thmsn_stitch_{epoch}"));
-    if let Err(e) = tokio::fs::create_dir_all(&tmp_root).await {
-        eprintln!("Failed to create temp directory");
-        return Err(e.into());
-    }
-
     for plan in spec {
         let tx = tx.clone();
-        let tmp_root = tmp_root.clone();
+        let tmp_root = path::run_tmp_root();
         executions.spawn(execute_plan(
             plan,
             tx,
@@ -90,15 +88,27 @@ async fn main() -> anyhow::Result<()> {
 
     let monitor_token = cancellation_token.child_token();
 
-    tokio::spawn(monitor(monitor_token.clone(), rx));
+    let handle = tokio::spawn(monitor(monitor_token.clone(), rx, args.verbose));
 
     executions.join_all().await;
     monitor_token.cancel();
 
+    match tokio::time::timeout(Duration::from_secs(1), handle).await {
+        Ok(Ok(_)) => { /* thread closed normally, nop */ }
+        Ok(Err(join_error)) => {
+            tracing::error!(error =% join_error, error_context =? join_error,"Failed to join monitor thread")
+        }
+        Err(_timeout) => tracing::warn!("Timed out waiting for monitor thread to close"),
+    }
+
     Ok(())
 }
 
-async fn monitor(ct: CancellationToken, mut rx: tokio::sync::mpsc::Receiver<ExecuteProgress>) {
+async fn monitor(
+    ct: CancellationToken,
+    mut rx: tokio::sync::mpsc::Receiver<ExecuteProgress>,
+    verbose: bool,
+) {
     #[derive(Debug)]
     enum Status {
         Starting,
@@ -144,13 +154,16 @@ async fn monitor(ct: CancellationToken, mut rx: tokio::sync::mpsc::Receiver<Exec
     let mut processes: HashMap<Uuid, ProcessState> = HashMap::new();
 
     loop {
-        if let Err(e) = update_display(&processes) {
-            todo!("Failed to update table, do i care tho???? >.<: {e}")
-        };
+        if !verbose {
+            if let Err(e) = update_display(&processes) {
+                todo!("Failed to update table, do i care tho???? >.<: {e}")
+            };
+        }
 
         let delivery = rx.recv().with_cancellation_token(&ct).await;
         match delivery {
             Some(Some(delivery)) => {
+                tracing::info!(id =% delivery.id, seq = delivery.seq, delivery = delivery.payload.as_value(), "Received delivery");
                 let entry = processes.entry(delivery.id).or_insert(ProcessState { name: "Uninitialized".into(), progress_pct: 0.0, status: Status::Starting });
 
                 match delivery.payload {

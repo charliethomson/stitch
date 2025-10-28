@@ -154,11 +154,10 @@ async fn monitor(
     let mut processes: HashMap<Uuid, ProcessState> = HashMap::new();
 
     loop {
-        if !verbose {
-            if let Err(e) = update_display(&processes) {
+        if !verbose
+            && let Err(e) = update_display(&processes) {
                 todo!("Failed to update table, do i care tho???? >.<: {e}")
             };
-        }
 
         let delivery = rx.recv().with_cancellation_token(&ct).await;
         match delivery {

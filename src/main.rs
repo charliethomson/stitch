@@ -27,16 +27,37 @@ pub mod ffprobe;
 pub mod logging;
 pub mod parse;
 pub mod path;
-
+/// ffmpeg wrapper to bulk stitch video files together based on a specification file
 #[derive(Parser)]
+#[command(
+    version,
+    author,
+    about,
+    long_about = None,
+    help_template = "\
+{before-help}{name} ({version})
+{author-with-newline}
+{about-with-newline}
+{usage-heading} {usage}
+
+{all-args}
+{after-help}"
+)]
 pub struct Args {
-    #[arg()]
+    /// Path to the specification file containing stitch instructions
+    #[arg(value_name = "SPEC_FILE")]
     pub spec: PathBuf,
-    #[arg(short = 'o', long)]
+
+    /// Output directory for stitched video files (default: current directory)
+    #[arg(short = 'o', long, value_name = "DIR", help_heading = "Directories")]
     pub target_dir: Option<PathBuf>,
-    #[arg(short = 'i', long)]
+
+    /// Input directory containing source video files (default: current directory)
+    #[arg(short = 'i', long, value_name = "DIR", help_heading = "Directories")]
     pub sources_dir: Option<PathBuf>,
-    #[arg(short, long, default_value_t = false)]
+
+    /// Enable verbose logging (configure with RUST_LOG environment variable)
+    #[arg(short, long)]
     pub verbose: bool,
 }
 
@@ -154,10 +175,9 @@ async fn monitor(
     let mut processes: HashMap<Uuid, ProcessState> = HashMap::new();
 
     loop {
-        if !verbose
-            && let Err(e) = update_display(&processes) {
-                todo!("Failed to update table, do i care tho???? >.<: {e}")
-            };
+        if !verbose && let Err(e) = update_display(&processes) {
+            todo!("Failed to update table, do i care tho???? >.<: {e}")
+        };
 
         let delivery = rx.recv().with_cancellation_token(&ct).await;
         match delivery {

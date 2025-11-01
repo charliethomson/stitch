@@ -10,6 +10,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use valuable::Valuable;
 
+use crate::env::get_ffmpeg;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Valuable, Error)]
 pub enum FfmpegError {
     #[error("cancellation requested")]
@@ -20,6 +22,12 @@ pub enum FfmpegError {
 
     #[error("exited unsuccessfully: {inner_error}")]
     BadExit { inner_error: AnyError },
+
+    #[error("acquire permit: {inner_error}")]
+    Acquire { inner_error: AnyError },
+
+    #[error("Unable to locate ffmpeg path, lock uninitialized")]
+    UninitializedPath,
 }
 
 pub type FfmpegResult = Result<FfmpegExit, FfmpegError>;
@@ -42,14 +50,26 @@ pub async fn ffmpeg<Cb>(
 where
     Cb: FnOnce(&mut Command),
 {
-    let mut cmd = Command::new("ffmpeg");
+    let ffmpeg_path = get_ffmpeg().ok_or(FfmpegError::UninitializedPath)?;
+
+    let mut cmd = Command::new(ffmpeg_path);
 
     cb(&mut cmd);
 
-    tracing::debug!(args = ?cmd.as_std().get_args().collect::<Vec<_>>(), "Executing ffmpeg command");
+    tracing::info!(args = ?cmd.as_std().get_args().collect::<Vec<_>>(), "Executing ffmpeg command");
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+
+    let _permit = crate::limits::LIMIT_PROCESSES
+        .acquire()
+        .await
+        .map_err(|e| FfmpegError::Acquire {
+            inner_error: e.into(),
+        })
+        .inspect_err(
+            |e| tracing::error!(error =% e, error_context =? e, "Failed to acquire permit"),
+        )?;
 
     let mut child = cmd.spawn().map_err(|e| FfmpegError::BadSpawn {
         inner_error: e.into(),
@@ -100,14 +120,14 @@ where
                 result.stdout_lines.push(line.clone());
                 tracing::debug!(line = line, "ffmpeg wrote to stdout");
                 if let Err(e) = stdout_tx.send(line).await {
-                    todo!("Failed to write stdout_tx: {e}");
+                    tracing::error!(error =% e, error_context =? e, "Failed to write stdout_tx");
                 };
             }
             Ok(Some(line)) = stderr.next_line() => {
                 result.stderr_lines.push(line.clone());
                 tracing::debug!(line = line, "ffmpeg wrote to stderr");
                 if let Err(e) = stderr_tx.send(line).await {
-                    todo!("Failed to write stderr_tx: {e}");
+                    tracing::error!(error =% e, error_context =? e, "Failed to write stderr_tx");
                 };
             }
         }

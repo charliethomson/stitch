@@ -17,7 +17,6 @@ pub fn register_tracing_subscriber(quiet: bool) {
     let log_path = crate::path::logs_path();
     let log_file = std::fs::OpenOptions::new()
         .create(true)
-        
         .append(true)
         .open(log_path)
         .expect("Failed to open log file");

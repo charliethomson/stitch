@@ -10,6 +10,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use valuable::Valuable;
 
+use crate::env::get_ffprobe;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Valuable, Error)]
 pub enum FfprobeError {
     #[error("cancellation requested")]
@@ -20,6 +22,12 @@ pub enum FfprobeError {
 
     #[error("exited unsuccessfully: {inner_error}")]
     BadExit { inner_error: AnyError },
+
+    #[error("acquire permit: {inner_error}")]
+    Acquire { inner_error: AnyError },
+
+    #[error("Unable to locate ffprobe path, lock uninitialized")]
+    UninitializedPath,
 }
 
 #[derive(Debug)]
@@ -34,7 +42,9 @@ pub async fn ffprobe<Cb>(ct: CancellationToken, cb: Cb) -> Result<FfprobeExit, F
 where
     Cb: FnOnce(&mut Command),
 {
-    let mut cmd = Command::new("ffprobe");
+    let ffprobe_path = get_ffprobe().ok_or(FfprobeError::UninitializedPath)?;
+
+    let mut cmd = Command::new(ffprobe_path);
 
     cb(&mut cmd);
 
@@ -43,6 +53,15 @@ where
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
+    let _permit = crate::limits::LIMIT_PROCESSES
+        .acquire()
+        .await
+        .map_err(|e| FfprobeError::Acquire {
+            inner_error: e.into(),
+        })
+        .inspect_err(
+            |e| tracing::error!(error =% e, error_context =? e, "Failed to acquire permit"),
+        )?;
     let mut child = cmd.spawn().map_err(|e| FfprobeError::BadSpawn {
         inner_error: e.into(),
     })?;

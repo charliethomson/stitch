@@ -9,13 +9,21 @@ use tracing::{Level, instrument};
 use valuable::Valuable;
 
 lazy_static! {
-    static ref RE_TARGET: Regex = Regex::new(r#"^(.+):$"#).expect("Failed to compile RE_TARGET");
-    static ref RE_SOURCE: Regex = Regex::new(r#"^\t(.+)$"#).expect("Failed to compile RE_SOURCE");
+    static ref RE_TARGET: Regex =
+        Regex::new(r#"^(.+):(.*)$"#).expect("Failed to compile RE_TARGET");
+    static ref RE_SOURCE: Regex = Regex::new(r#"^\s+(.+)$"#).expect("Failed to compile RE_SOURCE");
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Valuable, strum::EnumString)]
+pub enum Flag {
+    #[strum(serialize = "concat-filter", serialize = "catf")]
+    ConcatFilter,
 }
 
 #[derive(Debug, Clone, Valuable)]
 pub struct Plan {
     pub target_path: PlanPath,
+    pub flags: Vec<Flag>,
     pub sources: Vec<PlanPath>,
 }
 
@@ -26,14 +34,19 @@ pub struct PlanPath {
 }
 impl PlanPath {
     pub fn new_relative_to(from: &str, relative_to: PathBuf) -> Self {
-        let relative_path = format!(
-            "{}{}{from}",
-            relative_to.display(),
-            std::path::MAIN_SEPARATOR
-        );
+        let given_path = PathBuf::from(from);
+        let path = if given_path.is_absolute() {
+            given_path
+        } else {
+            PathBuf::from(format!(
+                "{}{}{from}",
+                relative_to.display(),
+                std::path::MAIN_SEPARATOR
+            ))
+        };
 
         Self {
-            path: PathBuf::from(relative_path),
+            path,
             leaf: from.to_string(),
         }
     }
@@ -41,6 +54,8 @@ impl PlanPath {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Valuable, Error)]
 pub enum ParseError {
+    #[error("Unknown flag \"{flag}\"")]
+    InvalidFlag { flag: String },
     #[error("Failed to locate spec at \"{path}\": {inner_error}")]
     SpecNotFound { path: String, inner_error: AnyError },
     #[error("Failed to open spec at \"{path}\": {inner_error}")]
@@ -103,13 +118,13 @@ fn get_spec_reader(
     Ok(reader.lines())
 }
 
-fn try_get_first_capture(line: &str, regex: &Regex) -> Result<Option<String>, ParseError> {
+fn try_get_nth_capture(line: &str, regex: &Regex, n: usize) -> Result<Option<String>, ParseError> {
     if !regex.is_match(line) {
         return Ok(None);
     }
 
     let caps = regex.captures(line).expect("Should always have a capture");
-    Ok(caps.get(1).map(|c| c.as_str().trim().to_string()))
+    Ok(caps.get(n).map(|c| c.as_str().trim().to_string()))
 }
 
 #[instrument(level = Level::INFO)]
@@ -143,8 +158,9 @@ pub fn parse_spec(
             inner_error: e.into(),
         })?;
 
-        let target_result = try_get_first_capture(&line, &RE_TARGET)?;
-        let source_result = try_get_first_capture(&line, &RE_SOURCE)?;
+        let target_result = try_get_nth_capture(&line, &RE_TARGET, 1)?;
+        let flags_result = try_get_nth_capture(&line, &RE_TARGET, 2)?;
+        let source_result = try_get_nth_capture(&line, &RE_SOURCE, 1)?;
 
         match (target_result, source_result) {
             (Some(target), None) => {
@@ -171,8 +187,21 @@ pub fn parse_spec(
                     plans.push(plan);
                 }
 
+                let flags = match flags_result {
+                    Some(flagspec) if !flagspec.trim().is_empty() => flagspec
+                        .split(",")
+                        .map(|flag| {
+                            Flag::try_from(flag.trim()).map_err(|_| ParseError::InvalidFlag {
+                                flag: flag.trim().to_string(),
+                            })
+                        })
+                        .collect::<Result<Vec<_>, ParseError>>()?,
+                    _ => vec![],
+                };
+
                 plan = Some(Plan {
                     target_path: PlanPath::new_relative_to(&target, target_dir.clone()),
+                    flags,
                     sources: vec![],
                 });
             }

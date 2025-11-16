@@ -18,7 +18,7 @@ function video_color {
 }
 
 per_video_seconds=5
-colors=(red green blue)
+colors=(red green blue orange purple)
 total_seconds=$(echo "$per_video_seconds * ${#colors[@]}" | bc)
 
 for color in "${colors[@]}"; do
@@ -26,9 +26,9 @@ for color in "${colors[@]}"; do
 done
 
 echo 'colors.mp4:' >> .tmp/colors.stitchspec
-echo '    red.mp4' >> .tmp/colors.stitchspec
-echo '    green.mp4' >> .tmp/colors.stitchspec
-echo '    blue.mp4' >> .tmp/colors.stitchspec
+for color in "${colors[@]}"; do
+    echo "    $color.mp4" >> .tmp/colors.stitchspec
+done
 
 RUST_LOG=debug cargo r --release -- .tmp/colors.stitchspec -i ./.tmp -o ./.tmp -v
 

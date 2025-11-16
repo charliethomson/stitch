@@ -33,22 +33,34 @@ pub struct PlanPath {
     pub leaf: String,
 }
 impl PlanPath {
-    pub fn new_relative_to(from: &str, relative_to: PathBuf) -> Self {
+    pub fn new_relative_to(from: &str, relative_to: PathBuf) -> Result<Self, ParseError> {
         let given_path = PathBuf::from(from);
         let path = if given_path.is_absolute() {
             given_path
         } else {
-            PathBuf::from(format!(
-                "{}{}{from}",
-                relative_to.display(),
-                std::path::MAIN_SEPARATOR
-            ))
+            if !relative_to.exists() {
+                std::fs::create_dir_all(&relative_to).map_err(|e| ParseError::CreateBaseDir {
+                    from: from.to_string(),
+                    base: relative_to.display().to_string(),
+                    inner_error: e.into(),
+                })?;
+            }
+
+            let base = relative_to
+                .canonicalize()
+                .map_err(|e| ParseError::InvalidPath {
+                    from: from.to_string(),
+                    base: relative_to.display().to_string(),
+                    inner_error: e.into(),
+                })?;
+
+            base.join(from)
         };
 
-        Self {
+        Ok(Self {
             path,
             leaf: from.to_string(),
-        }
+        })
     }
 }
 
@@ -78,6 +90,18 @@ pub enum ParseError {
     Validation { errors: Vec<ValidationError> },
     #[error("Unable to parse line: \"{line}\"")]
     InvalidLine { line: String },
+    #[error("Unable to create base directory {base} for {from}: {inner_error}")]
+    CreateBaseDir {
+        from: String,
+        base: String,
+        inner_error: AnyError,
+    },
+    #[error("Failed to canonicalize {from} in {base}: {inner_error}")]
+    InvalidPath {
+        from: String,
+        base: String,
+        inner_error: AnyError,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Valuable, Error)]
@@ -200,7 +224,7 @@ pub fn parse_spec(
                 };
 
                 plan = Some(Plan {
-                    target_path: PlanPath::new_relative_to(&target, target_dir.clone()),
+                    target_path: PlanPath::new_relative_to(&target, target_dir.clone())?,
                     flags,
                     sources: vec![],
                 });
@@ -218,7 +242,7 @@ pub fn parse_spec(
                     });
                 };
 
-                let source_path = PlanPath::new_relative_to(&source, sources_dir.clone());
+                let source_path = PlanPath::new_relative_to(&source, sources_dir.clone())?;
 
                 tracing::debug!(
                     line = line,

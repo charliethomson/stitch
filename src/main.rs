@@ -65,6 +65,8 @@ async fn main() -> anyhow::Result<()> {
     logging::register_tracing_subscriber(!args.verbose);
     let cancellation_token = CancellationToken::new();
 
+    libsignal::cancel_after_signal(cancellation_token.clone());
+
     let span = tracing::info_span!("main").entered();
 
     find_binaries(args.ffmpeg_path, args.ffprobe_path)?;

@@ -7,9 +7,12 @@ use std::{
     },
 };
 
-use lazy_static::lazy_static;
 use liberror::AnyError;
-use regex::Regex;
+use libffmpeg::{
+    duration::DurationError,
+    ffmpeg::ffmpeg_with_progress,
+    util::cmd::{self, CommandError, CommandExit},
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt, task::JoinSet};
@@ -18,28 +21,19 @@ use tracing::{Instrument, Level, Span, instrument};
 use uuid::Uuid;
 use valuable::Valuable;
 
-use crate::{
-    ffmpeg::{FfmpegError, FfmpegExit, ffmpeg},
-    ffprobe::{FfprobeError, ffprobe},
-    parse::{Flag, Plan},
-};
-
-lazy_static! {
-    static ref RE_OUT_TIME_US: Regex =
-        Regex::new(r#"^out_time_us=(\d+)$"#).expect("Failed to compile RE_OUT_TIME_US");
-}
+use crate::parse::{Flag, Plan};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Valuable, Error)]
 pub enum ExecuteError {
     #[error(transparent)]
-    Ffmpeg {
+    Command {
         #[from]
-        inner_error: FfmpegError,
+        inner_error: CommandError,
     },
     #[error(transparent)]
-    Ffprobe {
+    Duration {
         #[from]
-        inner_error: FfprobeError,
+        inner_error: DurationError,
     },
     #[error("Failed to send progress message: {inner_error}")]
     Send { inner_error: AnyError },
@@ -53,14 +47,8 @@ pub enum ExecuteError {
         catfile_path: String,
         inner_error: AnyError,
     },
-    #[error("Failed to get file duration, no output line found from ffprobe")]
-    NoDuration,
-    #[error(
-        "Failed to get file duration, ffprobe returned an invalid float \"{line}\": {inner_error}"
-    )]
-    InvalidDuration { line: String, inner_error: AnyError },
-    #[error("Failed to determine if some sources had audio tracks")]
-    AudioFailures { inner_errors: Vec<FfprobeError> },
+    #[error("Failed to determine if some sources had audio tracks: {inner_errors:?}")]
+    AudioFailures { inner_errors: Vec<CommandError> },
 }
 
 pub type ExecuteResult = Result<(), ExecuteError>;
@@ -85,7 +73,7 @@ pub enum ExecuteProgressPayload {
     Warning {
         message: String,
     },
-    Finished(FfmpegExit),
+    Finished(CommandExit),
     Failed(ExecuteError),
     Progress {
         total_seconds: f64,
@@ -212,14 +200,10 @@ impl Process {
         let mut tasks = JoinSet::new();
 
         for source in self.plan.sources.iter() {
-            let file_path = source.path.display().to_string();
-            #[rustfmt::skip]
-            let fut = ffprobe(self.cancellation_token.child_token(), |cmd| {
-                cmd.arg("-v").arg("error"); // shut up
-                cmd.arg("-show_entries").arg("format=duration"); // gimme duration
-                cmd.arg("-of").arg("default=noprint_wrappers=1:nokey=1"); // make it not ugly
-                cmd.arg(file_path);
-            });
+            let fut = libffmpeg::duration::get_duration(
+                source.path.clone(),
+                self.cancellation_token.child_token(),
+            );
 
             tasks.spawn(fut);
         }
@@ -228,18 +212,7 @@ impl Process {
 
         while let Some(result) = tasks.join_next().await {
             let result = result.expect("Failed to join task")?;
-            let source_seconds_str = result
-                .stdout_lines
-                .first()
-                .ok_or(ExecuteError::NoDuration)?;
-            let source_seconds =
-                &source_seconds_str
-                    .parse::<f64>()
-                    .map_err(|e| ExecuteError::InvalidDuration {
-                        line: source_seconds_str.to_string(),
-                        inner_error: e.into(),
-                    })?;
-            total_seconds += source_seconds;
+            total_seconds += result.as_secs_f64();
         }
 
         Ok(total_seconds)
@@ -251,7 +224,7 @@ impl Process {
         })
         .await;
 
-        let mut tasks: JoinSet<Result<(String, bool), FfprobeError>> = JoinSet::new();
+        let mut tasks: JoinSet<Result<(String, bool), CommandError>> = JoinSet::new();
         let span = Span::current();
 
         for source in self.plan.sources.iter() {
@@ -260,7 +233,7 @@ impl Process {
 
             tasks.spawn(
                 async move {
-                    let results = ffprobe(ct, |cmd| {
+                    let results = cmd::run("ffprobe", None, ct, |cmd| {
                         cmd.arg("-v").arg("error");
                         cmd.arg("-select_streams").arg("a");
                         cmd.arg("-show_entries").arg("stream=codec_type");
@@ -272,7 +245,7 @@ impl Process {
                     let has_audio = {
                         let exited_normally = results
                             .exit_code
-                            .map(|code| code.success())
+                            .map(|code| code.success)
                             .unwrap_or_default();
                         let has_stdout = !results.stdout_lines.is_empty();
                         let stdout_has_text = !results
@@ -317,10 +290,7 @@ impl Process {
     }
 
     #[instrument(level = Level::INFO)]
-    async fn execute(self: Arc<Self>, catfile_path: PathBuf) -> Result<FfmpegExit, ExecuteError> {
-        let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::channel(100);
-        let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::channel(100);
-
+    async fn execute(self: Arc<Self>, catfile_path: PathBuf) -> Result<CommandExit, ExecuteError> {
         let plan = self.plan.clone();
 
         let source_has_audio = self.get_source_has_audio().await?;
@@ -368,86 +338,84 @@ impl Process {
         .await;
 
         let target_path = self.plan.target_path.path.display().to_string();
-        let process = ffmpeg(
-            self.cancellation_token.child_token(),
-            stdout_tx,
-            stderr_tx,
-            move |cmd| {
-                let flags = plan.flags;
-                let sources = plan.sources;
-                let catf = flags.iter().copied().any(|flag| flag == Flag::ConcatFilter);
-                if catf {
-                    for source in sources.iter() {
-                        cmd.arg("-i").arg(&source.path);
-                    }
 
-                    let all_have_audio = sources
-                        .iter()
-                        .all(|source| source_has_audio.get(&source.leaf).copied().unwrap_or(false));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
 
-                    cmd.arg("-vsync").arg("cfr");
-                    cmd.arg("-r").arg("30");
-
-                    if all_have_audio {
-                        // All have audio - concat video and audio
-                        let input_list = (0..sources.len())
-                            .map(|i| format!("[{i}:v]fps=30,format=yuv420p[v{i}];"))
-                            .collect::<Vec<_>>()
-                            .join("");
-
-                        let audio_prep = (0..sources.len())
-                            .map(|i| format!("[{i}:a]anull[a{i}];"))
-                            .collect::<Vec<_>>()
-                            .join("");
-
-                        let video_directives = (0..sources.len())
-                            .map(|i| format!("[v{i}][a{i}]"))
-                            .collect::<Vec<_>>()
-                            .join("");
-
-                        let opts = format!("concat=n={}:v=1:a=1[outv][outa]", sources.len());
-                        let filter_complex =
-                            format!("{input_list}{audio_prep}{video_directives}{opts}");
-
-                        cmd.arg("-filter_complex").arg(filter_complex);
-                        cmd.arg("-map").arg("[outv]");
-                        cmd.arg("-map").arg("[outa]");
-                        cmd.arg("-c:a").arg("aac");
-                        cmd.arg("-b:a").arg("128k");
-                    } else {
-                        // Not all have audio - video only
-                        let input_list = (0..sources.len())
-                            .map(|i| format!("[{i}:v]fps=30,format=yuv420p[v{i}];"))
-                            .collect::<Vec<_>>()
-                            .join("");
-
-                        let video_directives = (0..sources.len())
-                            .map(|i| format!("[v{i}]"))
-                            .collect::<Vec<_>>()
-                            .join("");
-
-                        let opts = format!("concat=n={}:v=1:a=0[outv]", sources.len());
-                        let filter_complex = format!("{input_list}{video_directives}{opts}");
-
-                        cmd.arg("-filter_complex").arg(filter_complex);
-                        cmd.arg("-map").arg("[outv]");
-                    }
-
-                    cmd.arg("-c:v").arg("libx264");
-                    cmd.arg("-preset").arg("medium");
-                    cmd.arg("-crf").arg("23");
-                    cmd.arg("-progress").arg("pipe:1");
-                } else {
-                    cmd.arg("-f").arg("concat");
-                    cmd.arg("-safe").arg("0");
-                    cmd.arg("-i").arg(catfile_path);
-                    cmd.arg("-progress").arg("pipe:1");
-                    cmd.arg("-c").arg("copy");
+        let process = ffmpeg_with_progress(tx, self.cancellation_token.child_token(), move |cmd| {
+            let flags = plan.flags;
+            let sources = plan.sources;
+            let catf = flags.iter().copied().any(|flag| flag == Flag::ConcatFilter);
+            if catf {
+                for source in sources.iter() {
+                    cmd.arg("-i").arg(&source.path);
                 }
-                cmd.arg(target_path);
-                cmd.arg("-y");
-            },
-        );
+
+                let all_have_audio = sources
+                    .iter()
+                    .all(|source| source_has_audio.get(&source.leaf).copied().unwrap_or(false));
+
+                cmd.arg("-vsync").arg("cfr");
+                cmd.arg("-r").arg("30");
+
+                if all_have_audio {
+                    // All have audio - concat video and audio
+                    let input_list = (0..sources.len())
+                        .map(|i| format!("[{i}:v]fps=30,format=yuv420p[v{i}];"))
+                        .collect::<Vec<_>>()
+                        .join("");
+
+                    let audio_prep = (0..sources.len())
+                        .map(|i| format!("[{i}:a]anull[a{i}];"))
+                        .collect::<Vec<_>>()
+                        .join("");
+
+                    let video_directives = (0..sources.len())
+                        .map(|i| format!("[v{i}][a{i}]"))
+                        .collect::<Vec<_>>()
+                        .join("");
+
+                    let opts = format!("concat=n={}:v=1:a=1[outv][outa]", sources.len());
+                    let filter_complex =
+                        format!("{input_list}{audio_prep}{video_directives}{opts}");
+
+                    cmd.arg("-filter_complex").arg(filter_complex);
+                    cmd.arg("-map").arg("[outv]");
+                    cmd.arg("-map").arg("[outa]");
+                    cmd.arg("-c:a").arg("aac");
+                    cmd.arg("-b:a").arg("128k");
+                } else {
+                    // Not all have audio - video only
+                    let input_list = (0..sources.len())
+                        .map(|i| format!("[{i}:v]fps=30,format=yuv420p[v{i}];"))
+                        .collect::<Vec<_>>()
+                        .join("");
+
+                    let video_directives = (0..sources.len())
+                        .map(|i| format!("[v{i}]"))
+                        .collect::<Vec<_>>()
+                        .join("");
+
+                    let opts = format!("concat=n={}:v=1:a=0[outv]", sources.len());
+                    let filter_complex = format!("{input_list}{video_directives}{opts}");
+
+                    cmd.arg("-filter_complex").arg(filter_complex);
+                    cmd.arg("-map").arg("[outv]");
+                }
+
+                cmd.arg("-c:v").arg("libx264");
+                cmd.arg("-preset").arg("medium");
+                cmd.arg("-crf").arg("23");
+                cmd.arg("-progress").arg("pipe:1");
+            } else {
+                cmd.arg("-f").arg("concat");
+                cmd.arg("-safe").arg("0");
+                cmd.arg("-i").arg(catfile_path);
+                cmd.arg("-progress").arg("pipe:1");
+                cmd.arg("-c").arg("copy");
+            }
+            cmd.arg(target_path);
+            cmd.arg("-y");
+        });
 
         let monitor_token = self.cancellation_token.child_token();
         let this = self.clone();
@@ -458,47 +426,20 @@ impl Process {
         {
             let this = this.clone();
             let monitor_token = monitor_token.clone();
-            tasks.spawn(async move {
-                loop {
-                    match stdout_rx.recv().with_cancellation_token(&monitor_token).await {
-                        Some(Some(line)) => {
-                            if !RE_OUT_TIME_US.is_match(&line) { continue; }
-                            let cap = RE_OUT_TIME_US.captures(&line).and_then(|caps| caps.get(1)).map(|cap| cap.as_str());
-                            let Some(cap) = cap else { unreachable!("out_time_us is match but no capture") };
-                            match cap.parse::<f64>() {
-                                Err(e) => {
-                                    tracing::error!(error =% e, error_context =? e, line = line, cap = cap, "UNHANDLED: Failed to parse rhs cap of the out_time_us progress log")
-                                }
-                                Ok(out_time_us) => {
-                                    this.send(ExecuteProgressPayload::Progress {
-                                        total_seconds,
-                                        current_seconds: out_time_us / 1_000_000.0,
-                                    }).await;
-                                }
-                            }
-                        },
-                        Some(None) /* Channel closed */ => { break },
-                        None /* cancelled */ => { break },
-                    }
-                }
-            }
-            .instrument(span.clone()),
-            );
-        }
-
-        /* stderr task - drain stderr to prevent blocking */
-        {
-            let monitor_token = monitor_token.clone();
             tasks.spawn(
                 async move {
                     loop {
-                        match stderr_rx.recv().with_cancellation_token(&monitor_token).await {
-                        Some(Some(_line)) => {
-                            // Just drain stderr, it's already logged in ffmpeg.rs
-                        },
-                        Some(None) /* Channel closed */ => { break },
-                        None /* cancelled */ => { break },
-                    }
+                        let current_duration = match rx.recv()
+                        .with_cancellation_token(&monitor_token).await {
+                            Some(Some(current_duration)) => current_duration,
+                            Some(None) /* closed */ => break,
+                            None /* cancelled */ => break,
+                        };
+                        this.send(ExecuteProgressPayload::Progress {
+                            total_seconds,
+                            current_seconds: current_duration.as_secs_f64(),
+                        })
+                        .await;
                     }
                 }
                 .instrument(span.clone()),
@@ -528,7 +469,7 @@ pub async fn execute_plan(
 }
 
 #[instrument(level = Level::INFO)]
-async fn _execute_plan(process: Arc<Process>) -> Result<FfmpegExit, ExecuteError> {
+async fn _execute_plan(process: Arc<Process>) -> Result<CommandExit, ExecuteError> {
     process.start().await;
     let catfile_path = process.prepare_catfile().await?;
     process.execute(catfile_path).await

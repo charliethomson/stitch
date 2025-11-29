@@ -4,7 +4,7 @@ A shitty ffmpeg wrapper for bulk concatenating video files
 
 ## Installation
 ```bash
-git clone https://github.com/charliethomson/stitch && cd stitch && cargo install --path .
+RUSTFLAGS="--cfg tracing_unstable" cargo install --git https://github.com/charliethomson/stitch
 ```
 
 ## Usage

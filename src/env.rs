@@ -14,14 +14,13 @@ fn validate_binary<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
     let meta = std::fs::metadata(&path)?;
 
     if !meta.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             format!("Expected file, got {:?}", meta.file_type()),
         ));
     }
 
     // TODO: check +x? do i give a shit? do i look like i give a shit? dont fuckin pass some dumb shit man
-    return Ok(path);
+    Ok(path)
 }
 
 #[instrument(level = Level::DEBUG)]

@@ -10,7 +10,7 @@ use std::{
 use liberror::AnyError;
 use libffmpeg::{
     duration::DurationError,
-    ffmpeg::ffmpeg_with_progress,
+    ffmpeg::{FfmpegError, ffmpeg_with_progress},
     util::cmd::{self, CommandError, CommandExit},
 };
 use serde::{Deserialize, Serialize};
@@ -26,9 +26,9 @@ use crate::parse::{Flag, Plan};
 #[derive(Debug, Clone, Serialize, Deserialize, Valuable, Error)]
 pub enum ExecuteError {
     #[error(transparent)]
-    Command {
+    Ffmpeg {
         #[from]
-        inner_error: CommandError,
+        inner_error: FfmpegError,
     },
     #[error(transparent)]
     Duration {
